@@ -1,0 +1,199 @@
+---
+# Minimal Keycloak Configuration
+# This configuration provides a basic, working Keycloak instance with minimal overhead.
+# Suitable for development, testing, and non-critical environments.
+#
+# Prerequisites:
+# 1. A PostgreSQL database (see postgres-secret.yml and postgres-deployment.yml)
+# 2. TLS certificate (see tls-secret.yml)
+# 3. Configured hostname/ingress
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keycloak
+
+---
+# Database credentials secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-db-secret
+  namespace: keycloak
+type: Opaque
+stringData:
+  username: keycloak
+  password: change-me-in-production  # IMPORTANT: Change this in production!
+  database: keycloak
+
+---
+# Ephemeral PostgreSQL for development/testing
+# WARNING: Data will be lost when pod restarts. Use external DB for production.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-db
+  namespace: keycloak
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-db
+  namespace: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-db-secret
+                  key: database
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-db-secret
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-db-secret
+                  key: password
+          ports:
+            - containerPort: 5432
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+---
+# Self-signed TLS certificate (for development only)
+# In production, use cert-manager or provide your own certificate
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-tls-secret
+  namespace: keycloak
+type: kubernetes.io/tls
+stringData:
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    # Replace with your actual certificate
+    # This is a placeholder - generate with:
+    # openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    #   -keyout tls.key -out tls.crt -subj "/CN=keycloak.local"
+    -----END CERTIFICATE-----
+  tls.key: |
+    -----BEGIN PRIVATE KEY-----
+    # Replace with your actual private key
+    -----END PRIVATE KEY-----
+
+---
+# Minimal Keycloak Instance
+apiVersion: k8s.keycloak.org/v2alpha1
+kind: Keycloak
+metadata:
+  name: keycloak
+  namespace: keycloak
+  labels:
+    app: keycloak
+spec:
+  # Single instance for minimal overhead
+  instances: 1
+
+  # Database configuration
+  db:
+    vendor: postgres
+    host: postgres-db
+    port: 5432
+    database: keycloak
+    usernameSecret:
+      name: keycloak-db-secret
+      key: username
+    passwordSecret:
+      name: keycloak-db-secret
+      key: password
+
+  # HTTP configuration
+  http:
+    tlsSecret: keycloak-tls-secret
+
+  # Hostname configuration
+  # IMPORTANT: Change this to your actual domain
+  hostname:
+    hostname: keycloak.local
+
+  # Proxy headers for ingress
+  proxy:
+    headers: xforwarded
+
+  # Resource limits (minimal)
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 2
+      memory: 1Gi
+
+  # Disable features not needed for basic operation
+  features:
+    disabled:
+      - admin-fine-grained-authz
+      - docker
+      - impersonation
+      - linkedin-oauth
+      - token-exchange
+
+  # Transaction settings
+  transaction:
+    xaEnabled: false
+
+---
+# Ingress example (optional - adjust for your ingress controller)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: keycloak
+  namespace: keycloak
+  annotations:
+    # Adjust these annotations for your ingress controller
+    # nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx  # Change to your ingress class
+  tls:
+    - hosts:
+        - keycloak.local
+      secretName: keycloak-tls-secret
+  rules:
+    - host: keycloak.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak-service
+                port:
+                  number: 8443

@@ -1,0 +1,472 @@
+---
+# Production-Grade High Availability Keycloak Configuration
+# This configuration provides a highly available, production-ready Keycloak deployment
+# with distributed caching, load balancing, and proper resource allocation.
+#
+# Prerequisites:
+# 1. External PostgreSQL database (HA setup recommended - e.g., AWS RDS, CloudNativePG)
+# 2. Valid TLS certificates (use cert-manager or external CA)
+# 3. Load balancer / Ingress controller
+# 4. Monitoring stack for metrics
+# 5. Persistent storage for database
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keycloak
+
+---
+# Database credentials secret (use external secret management in production)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-db-secret
+  namespace: keycloak
+type: Opaque
+stringData:
+  username: keycloak
+  password: ""  # Use external secrets operator or sealed secrets
+  database: keycloak
+
+---
+# TLS certificate secret (managed by cert-manager in production)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-tls-secret
+  namespace: keycloak
+  annotations:
+    cert-manager.io/certificate-name: keycloak
+type: kubernetes.io/tls
+data:
+  tls.crt: ""  # Managed by cert-manager
+  tls.key: ""  # Managed by cert-manager
+
+---
+# Production-Grade Keycloak Instance with High Availability
+apiVersion: k8s.keycloak.org/v2alpha1
+kind: Keycloak
+metadata:
+  name: keycloak
+  namespace: keycloak
+  labels:
+    app: keycloak
+    environment: production
+spec:
+  # High Availability: 3 replicas for fault tolerance
+  instances: 3
+
+  # Image configuration (use optimized custom image if available)
+  image: quay.io/keycloak/keycloak:26.4.5
+
+  # Start optimization (set to false if using custom optimized image)
+  startOptimized: false
+
+  # Database configuration - External HA PostgreSQL
+  db:
+    vendor: postgres
+    # For AWS RDS/Aurora with connection pooling
+    # vendor: postgres-aws-wrapper
+    host: postgres-ha.database.svc.cluster.local  # Replace with your DB host
+    port: 5432
+    database: keycloak
+    usernameSecret:
+      name: keycloak-db-secret
+      key: username
+    passwordSecret:
+      name: keycloak-db-secret
+      key: password
+    # Database connection pool settings
+    # All sizes should be identical for statement caching
+    poolInitialSize: 30
+    poolMinSize: 30
+    poolMaxSize: 30
+
+  # HTTP/HTTPS configuration
+  http:
+    tlsSecret: keycloak-tls-secret
+    # HTTP port configuration
+    httpPort: 8080
+    httpsPort: 8443
+    # Max queued requests for load shedding (return 503 when exceeded)
+    maxQueuedRequests: 1000
+
+  # Hostname configuration
+  hostname:
+    hostname: keycloak.example.com  # Replace with your domain
+    admin: admin.keycloak.example.com  # Separate admin hostname
+    strict: true
+    strictBackchannel: true
+
+  # Proxy configuration for load balancer/ingress
+  proxy:
+    headers: xforwarded
+
+  # Infinispan cache configuration for distributed caching
+  cache:
+    stack: kubernetes  # Use kubernetes for JGroups discovery
+    configMapFile:
+      name: keycloak-cache-config
+      key: cache-ispn.xml  # Custom cache configuration (optional)
+
+  # Production features configuration
+  features:
+    enabled:
+      - multi-site  # Enable multi-cluster support
+      - token-exchange
+      - admin-fine-grained-authz
+      - declarative-user-profile
+    disabled:
+      - docker  # Disable unused features
+      - impersonation  # Security best practice
+      - linkedin-oauth  # Disable if not needed
+
+  # Logging configuration
+  logging:
+    level: info
+    format: json  # JSON format for log aggregation
+    console:
+      enabled: true
+      color: false
+
+  # Metrics and health endpoints
+  metrics:
+    enabled: true
+
+  health:
+    enabled: true
+
+  # Transaction configuration
+  transaction:
+    xaEnabled: true  # Enable XA transactions for HA
+
+  # Resource limits per pod (production sizing)
+  # Based on Keycloak HA guide recommendations
+  resources:
+    requests:
+      cpu: "2"       # 2 vCPU base
+      memory: 1250Mi # Base + 10k sessions
+    limits:
+      cpu: "6"       # Allow bursting to 6 vCPU
+      memory: 2250Mi # Allow for load spikes
+
+  # Pod distribution for high availability
+  unsupported:
+    podTemplate:
+      spec:
+        # Anti-affinity: spread pods across nodes
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app: keycloak
+                topologyKey: kubernetes.io/hostname
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  labelSelector:
+                    matchLabels:
+                      app: keycloak
+                  topologyKey: topology.kubernetes.io/zone
+
+        # Topology spread for even distribution across zones
+        topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: topology.kubernetes.io/zone
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                app: keycloak
+
+        # Security context
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          fsGroup: 1000
+          seccompProfile:
+            type: RuntimeDefault
+
+        # Container security
+        containers:
+          - name: keycloak
+            securityContext:
+              allowPrivilegeEscalation: false
+              runAsNonRoot: true
+              runAsUser: 1000
+              capabilities:
+                drop:
+                  - ALL
+              readOnlyRootFilesystem: false
+
+        # DNS configuration for faster lookups
+        dnsConfig:
+          options:
+            - name: ndots
+              value: "1"
+
+        # Priority class for critical workload
+        priorityClassName: system-cluster-critical
+
+---
+# Custom cache configuration for production (optional)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-cache-config
+  namespace: keycloak
+data:
+  cache-ispn.xml: |
+    <?xml version="1.0" encoding="UTF-8"?>
+    <infinispan
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="urn:infinispan:config:14.0 http://www.infinispan.org/schemas/infinispan-config-14.0.xsd"
+        xmlns="urn:infinispan:config:14.0">
+      <cache-container name="keycloak">
+        <transport lock-timeout="60000"/>
+        <local-cache name="realms">
+          <encoding>
+            <key media-type="application/x-java-object"/>
+            <value media-type="application/x-java-object"/>
+          </encoding>
+          <memory max-count="40000"/>  <!-- 4x concurrent clients for production -->
+        </local-cache>
+        <local-cache name="users">
+          <encoding>
+            <key media-type="application/x-java-object"/>
+            <value media-type="application/x-java-object"/>
+          </encoding>
+          <memory max-count="20000"/>  <!-- 2x concurrent clients -->
+        </local-cache>
+        <distributed-cache name="sessions" owners="2">
+          <expiration lifespan="-1"/>
+        </distributed-cache>
+        <distributed-cache name="authenticationSessions" owners="2">
+          <expiration lifespan="-1"/>
+        </distributed-cache>
+        <distributed-cache name="offlineSessions" owners="2">
+          <expiration lifespan="-1"/>
+        </distributed-cache>
+        <distributed-cache name="clientSessions" owners="2">
+          <expiration lifespan="-1"/>
+        </distributed-cache>
+        <distributed-cache name="offlineClientSessions" owners="2">
+          <expiration lifespan="-1"/>
+        </distributed-cache>
+        <distributed-cache name="loginFailures" owners="2">
+          <expiration lifespan="-1"/>
+        </distributed-cache>
+        <distributed-cache name="actionTokens" owners="2">
+          <expiration max-idle="300000" lifespan="-1"/>
+        </distributed-cache>
+      </cache-container>
+    </infinispan>
+
+---
+# Service for Keycloak (LoadBalancer or use Ingress)
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-lb
+  namespace: keycloak
+  annotations:
+    # Example for AWS NLB
+    # service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    # service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+spec:
+  type: LoadBalancer
+  sessionAffinity: None  # Disable sticky sessions for even distribution
+  selector:
+    app: keycloak-app
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8443
+      protocol: TCP
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+
+---
+# Ingress for Keycloak with TLS termination
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: keycloak
+  namespace: keycloak
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "route"
+    nginx.ingress.kubernetes.io/session-cookie-expires: "172800"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "172800"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "128k"
+    nginx.ingress.kubernetes.io/proxy-buffers-number: "4"
+    # Rate limiting
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - keycloak.example.com
+        - admin.keycloak.example.com
+      secretName: keycloak-tls-secret
+  rules:
+    - host: keycloak.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak-service
+                port:
+                  number: 8443
+    - host: admin.keycloak.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak-service
+                port:
+                  number: 8443
+
+---
+# PodDisruptionBudget for high availability
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: keycloak-pdb
+  namespace: keycloak
+spec:
+  minAvailable: 2  # Always keep at least 2 pods running
+  selector:
+    matchLabels:
+      app: keycloak
+
+---
+# HorizontalPodAutoscaler for dynamic scaling
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: keycloak-hpa
+  namespace: keycloak
+spec:
+  scaleTargetRef:
+    apiVersion: k8s.keycloak.org/v2alpha1
+    kind: Keycloak
+    name: keycloak
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # Wait 5 minutes before scaling down
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60  # Quick scale up
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+
+---
+# ServiceMonitor for Prometheus metrics (requires prometheus-operator)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: keycloak
+  namespace: keycloak
+  labels:
+    app: keycloak
+spec:
+  selector:
+    matchLabels:
+      app: keycloak
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+
+---
+# NetworkPolicy for enhanced security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  podSelector:
+    matchLabels:
+      app: keycloak
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow from ingress controller
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8443
+    # Allow inter-pod communication for caching
+    - from:
+        - podSelector:
+            matchLabels:
+              app: keycloak
+      ports:
+        - protocol: TCP
+          port: 7800  # JGroups
+        - protocol: TCP
+          port: 57800  # JGroups FD
+  egress:
+    # Allow DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+    # Allow database access
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: database
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Allow inter-pod communication
+    - to:
+        - podSelector:
+            matchLabels:
+              app: keycloak
+    # Allow HTTPS for external identity providers
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 443
